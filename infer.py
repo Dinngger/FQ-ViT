@@ -1,5 +1,6 @@
 import os
 import math
+from time import time
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -50,38 +51,57 @@ class QAct:
         # return outputs.astype(np.uint8)
         if self.module_type == 'activation':
             outputs = np.clip(outputs.round(), 0, 2**8 - 1)
+            return outputs.astype(np.uint8)
         elif self.module_type == 'weight':
             outputs = np.clip(outputs.round(), -2**7, 2**7 - 1)
+            return outputs.astype(np.int8)
         else:
             raise NotImplementedError
-        return outputs.astype(np.float32)
     def dequant(self, inputs):
-        assert inputs.dtype == np.float32, inputs.dtype
+        if self.module_type == 'activation':
+            assert inputs.dtype == np.uint8, inputs.dtype
+        else:
+            assert inputs.dtype == np.int8, inputs.dtype
         range_shape = self.get_reshape_range(inputs)
         scale = self.scale.reshape(range_shape)
         zero_point = self.zero_point.reshape(range_shape)
         outputs = (inputs.astype(np.float32) - zero_point) * scale
         return outputs.astype(np.float32)
     def __call__(self, x):
-        return self.dequant(self.quant(x))
+        return self.quant(x)
+
+def int_matmul(x, w, xq: QAct, wq: QAct):
+    assert x.dtype == np.uint8, x.dtype
+    assert w.dtype == np.int8, w.dtype
+    x = x.astype(np.int32)  # (N, D)
+    w = w.transpose(1, 0)   # (D, E)
+    xw = x @ w  # (N, E)
+    wz = wq.zero_point.astype(np.float32) * np.ones_like(w, dtype=np.float32)
+    xz = xq.zero_point.astype(np.float32) * np.ones_like(x, dtype=np.float32)
+    x = x.astype(np.float32)
+    xw = xw.astype(np.float32)
+    xw = xq.scale * wq.scale * (xw - x @ wz - xz @ w + xz @ wz)
+    assert xw.dtype == np.float32, xw.dtype
+    return xw
 
 class QConv2d:
     def __init__(self, name):
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
         self.quantizer = QAct(name, 'weight')
-    def __call__(self, x):
-        assert x.dtype == np.float32, x.dtype
+        self.weight = self.quantizer(self.weight)
+    def __call__(self, x, xq):
+        assert x.dtype == np.uint8, x.dtype
         assert x.shape == (1, 3, 224, 224)
         assert self.weight.shape == (192, 3, 16, 16)
         assert self.bias.shape == (192,)
-        reshaped_x = np.zeros((768, 14 * 14), dtype=np.float32)
+        reshaped_x = np.zeros((768, 14 * 14), dtype=np.uint8)
         for i in range(14):
             for j in range(14):
                 reshaped_x[:, i * 14 + j] = x[0, :, i*16:i*16+16, j*16:j*16+16].flatten()
-        weight = self.quantizer(self.weight)
-        weight = weight.reshape(192, 768)
-        output = (weight @ reshaped_x) + self.bias.reshape(192, 1)
+        weight = self.weight.reshape(192, 768)
+        output = int_matmul(reshaped_x.T, weight, xq, self.quantizer).T
+        output = output + self.bias.reshape(192, 1)
         return output.reshape(1, 192, 14 * 14).transpose(0, 2, 1)
 
 class QLinear:
@@ -89,10 +109,10 @@ class QLinear:
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
         self.quantizer = QAct(name, 'weight')
-    def __call__(self, x):
-        assert x.dtype == np.float32, x.dtype
-        weight = self.quantizer(self.weight)
-        x = x @ weight.transpose(1, 0)
+        self.weight = self.quantizer(self.weight)
+    def __call__(self, x, xq):
+        assert x.dtype == np.uint8, x.dtype
+        x = int_matmul(x, self.weight, xq, self.quantizer)
         x = x + self.bias.reshape(1, 1, -1)
         return x
 
@@ -106,6 +126,7 @@ class QIntLayerNorm:
         M = np.clip(np.floor(x * np.power(2, N)), 0, 2 ** bit - 1)
         return M, N
     def __call__(self, x, in_quantizer, out_quantizer):
+        assert x.dtype == np.float32, x.dtype
         in_scale = in_quantizer.scale
         out_scale = out_quantizer.scale
         channel_nums = x.shape[-1]
@@ -169,6 +190,7 @@ class QIntSoftmax:
         exp_int_sum = exp_int.sum(axis=-1, keepdims=True)
         return exp_int, exp_int_sum
     def __call__(self, x, scale):
+        assert x.dtype == np.float32, x.dtype
         exp_int, exp_int_sum = self.int_softmax(x, scale)
         softmax_out = np.round(exp_int_sum / exp_int)
         rounds = self.log_round(softmax_out)    # uint4
@@ -179,6 +201,8 @@ class QIntSoftmax:
         return deq_softmax
 
 def mm_attention(q, k):
+    assert q.dtype == np.float32, q.dtype
+    assert k.dtype == np.float32, k.dtype
     z = np.einsum('BHMN,BHNK->BHMK', q, k.transpose(0, 1, 3, 2))
     return z
 
@@ -195,21 +219,22 @@ class Attention:
         self.qact2 = QAct(f"{name}.qact2")
         self.proj = QLinear(f"{name}.proj")
         self.qact3 = QAct(f"{name}.qact3")
-    def __call__(self, x):
+    def __call__(self, x, xq):
+        assert x.dtype == np.uint8, x.dtype
         B, N, C = x.shape
-        x = self.qkv(x)
-        x = self.qact1(x)
+        x = self.qkv(x, xq)
+        x = self.qact1.dequant(self.qact1(x))
         qkv = x.reshape(B, N, 3, self.num_heads,
                         C // self.num_heads).transpose(2, 0, 3, 1, 4)  # (BN33)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = mm_attention(q, k) * self.scale
-        attn = self.qact_attn1(attn)
+        attn = self.qact_attn1.dequant(self.qact_attn1(attn))
         attn = self.log_int_softmax(attn, self.qact_attn1.scale)
         x = np.einsum('BHMN,BHNK->BHMK', attn, v)
         x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
         x = self.qact2(x)
-        x = self.proj(x)
-        x = self.qact3(x)
+        x = self.proj(x, self.qact2)
+        x = self.qact3.dequant(self.qact3(x))
         return x
 
 class GELU:
@@ -223,12 +248,12 @@ class Mlp:
         self.qact1 = QAct(f"{name}.qact1")
         self.fc2 = QLinear(f"{name}.fc2")
         self.qact2 = QAct(f"{name}.qact2")
-    def __call__(self, x):
-        x = self.fc1(x)
+    def __call__(self, x, xq):
+        x = self.fc1(x, xq)
         x = self.act(x)
         x = self.qact1(x)
-        x = self.fc2(x)
-        x = self.qact2(x)
+        x = self.fc2(x, self.qact1)
+        x = self.qact2.dequant(self.qact2(x))
         return x
 
 class Block:
@@ -242,10 +267,11 @@ class Block:
         self.mlp = Mlp(f"{name}.mlp")
         self.qact4 = QAct(f"{name}.qact4")
     def __call__(self, x, last_quantizer):
-        x = self.qact2(x.astype(np.float32) + self.attn(self.qact1(
-                self.norm1(x, last_quantizer, self.qact1))))
-        x = self.qact4(x.astype(np.float32) + self.mlp(self.qact3(
-                self.norm2(x, self.qact2, self.qact3))))
+        assert x.dtype == np.float32, x.dtype
+        x = self.qact2.dequant(self.qact2(x.astype(np.float32) + self.attn(self.qact1(
+                self.norm1(x, last_quantizer, self.qact1)), self.qact1)))
+        x = self.qact4.dequant(self.qact4(x.astype(np.float32) + self.mlp(self.qact3(
+                self.norm2(x, self.qact2, self.qact3)), self.qact3)))
         return x
 
 class DeiT_tiny:
@@ -264,20 +290,21 @@ class DeiT_tiny:
         self.act_out = QAct("act_out")
     def __call__(self, x):
         x = self.qact_input(x)
-        x = self.patch_embed_proj(x)
-        x = self.patch_embed_qact(x)
+        x = self.patch_embed_proj(x, self.qact_input)
+        x = self.patch_embed_qact.dequant(self.patch_embed_qact(x))
         x = np.concatenate((self.cls_token, x), axis=1)
-        x = self.qact_embed(x)
+        x = self.qact_embed.dequant(self.qact_embed(x))
         x = x + self.pos_embed
-        x = self.qact1(x)
+        x = self.qact1.dequant(self.qact1(x))
         last_quantizer = self.qact1
         for b in self.blocks:
             x = b(x, last_quantizer)
             last_quantizer = b.qact4
         x = self.norm(x, last_quantizer, self.qact2)[:, 0]
         x = self.qact2(x)
-        x = self.head(x)
-        x = self.act_out(x)
+        x = self.head(x, self.qact2)
+        x = self.act_out.dequant(self.act_out(x))
+        assert x.dtype == np.float32, x.dtype
         return x
 
 valdir = '/media/dinger/inner/Dataset/ImageNet/val'
@@ -285,7 +312,8 @@ with open(os.path.join(valdir, "val_list.txt"), "r") as f:
     lines = f.readlines()
 top1, top5 = 0, 0
 model = DeiT_tiny()
-for i, line in enumerate(lines):
+times = []
+for i, line in enumerate(tqdm(lines)):
     now_img_idx = i
     name, label = line.strip().split()
     label = int(label)
@@ -294,11 +322,12 @@ for i, line in enumerate(lines):
     img = img.convert("RGB")
     img = transform(img).unsqueeze(0)
     img = img.numpy()
+    start = time()
     output = model(img)
+    times.append(time() - start)
     pred = np.argsort(output[0][0])[-5:][::-1]
-    print(f"{i} pred: {pred}, label: {label}")
     top1 += (pred[0] == label)
     top5 += (label in pred)
 
-print(f"evaluated {len(lines)} images.")
+print(f"evaluated {len(lines)} images, time: avg {np.mean(times):.4f}s, min {np.min(times):.4f}s, max {np.max(times):.4f}s")
 print(f"top1 = {top1}, top5 = {top5}")
