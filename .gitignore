@@ -108,6 +108,7 @@ data/
 data
 imagenet/
 datasets/
+export/
 
 .vscode
 .idea

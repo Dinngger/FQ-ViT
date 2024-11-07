@@ -5,6 +5,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.utils
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from PIL import Image
@@ -14,16 +15,19 @@ from models import *
 
 parser = argparse.ArgumentParser(description='FQ-ViT')
 
-parser.add_argument('model',
+parser.add_argument('--model',
+                    default='deit_tiny',
                     choices=[
                         'deit_tiny', 'deit_small', 'deit_base', 'vit_base',
                         'vit_large', 'swin_tiny', 'swin_small', 'swin_base'
                     ],
                     help='model')
-parser.add_argument('data', metavar='DIR', help='path to dataset')
-parser.add_argument('--quant', default=False, action='store_true')
-parser.add_argument('--ptf', default=False, action='store_true')
-parser.add_argument('--lis', default=False, action='store_true')
+parser.add_argument('--data', metavar='DIR',
+                    default='/media/dinger/inner/Dataset/ImageNet',
+                    help='path to dataset')
+parser.add_argument('--quant', default=True, action='store_true')
+parser.add_argument('--ptf', default=True, action='store_true')
+parser.add_argument('--lis', default=True, action='store_true')
 parser.add_argument('--quant-method',
                     default='minmax',
                     choices=['minmax', 'ema', 'omse', 'percentile'])
@@ -37,9 +41,9 @@ parser.add_argument('--val-batchsize',
                     type=int,
                     help='batchsize of validation set')
 parser.add_argument('--num-workers',
-                    default=16,
+                    default=8,
                     type=int,
-                    help='number of data loading workers (default: 16)')
+                    help='number of data loading workers (default: 8)')
 parser.add_argument('--device', default='cuda', type=str, help='device')
 parser.add_argument('--print-freq',
                     default=100,
@@ -81,6 +85,28 @@ def seed(seed=0):
     random.seed(seed)
 
 
+class my_val_dataset(torch.utils.data.Dataset):
+    def __init__(self, valdir, val_transform):
+        self.file_path = valdir
+        self.transform = val_transform
+        self.files = []
+        with open(os.path.join(self.file_path, "val_list.txt"), "r") as f:
+            for line in f.readlines():
+                name, label = line.strip().split()
+                self.files.append((name, int(label)))
+
+    def __getitem__(self, index):
+        name, label = self.files[index]
+        path = os.path.join(self.file_path, name)
+        img = Image.open(path)
+        img = img.convert("RGB")
+        img = self.transform(img)
+        return img, label
+
+    def __len__(self):
+        return len(self.files)
+
+
 def main():
     args = parser.parse_args()
     seed(args.seed)
@@ -114,7 +140,7 @@ def main():
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
 
-    val_dataset = datasets.ImageFolder(valdir, val_transform)
+    val_dataset = my_val_dataset(valdir, val_transform)
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.val_batchsize,
@@ -140,13 +166,14 @@ def main():
         )
         # Get calibration set.
         image_list = []
+        print(f'Get {len(train_loader)} batches of training data.')
         for i, (data, target) in enumerate(train_loader):
             if i == args.calib_iter:
                 break
             data = data.to(device)
             image_list.append(data)
 
-        print('Calibrating...')
+        print(f'Calibrating using {len(image_list)} batches.')
         model.model_open_calibrate()
         with torch.no_grad():
             for i, image in enumerate(image_list):
@@ -158,9 +185,47 @@ def main():
         model.model_close_calibrate()
         model.model_quant()
 
-    print('Validating...')
     val_loss, val_prec1, val_prec5 = validate(args, val_loader, model,
                                               criterion, device)
+    assert int(val_prec1) == 75
+    assert int(val_prec5) == 92
+    export_model(model)
+
+
+def export_model(model):
+    import numpy as np
+    np.save("export/cls_token.npy", model.cls_token.detach().cpu().numpy())
+    pos_embed = model.qact_pos(model.pos_embed)
+    np.save("export/pos_embed.npy", pos_embed.detach().cpu().numpy())
+    with torch.no_grad():
+        for name, m in model.named_modules():
+            if type(m) in [QConv2d, QLinear]:
+                weight = m.weight
+                scale = m.quantizer.scale
+                zero_point = m.quantizer.zero_point
+                bias = m.bias
+                # print(name, type(m).__name__, m.bit_type.name, weight.shape, weight.dtype)
+                assert m.bit_type.name == 'int8'
+                np.save(f"export/{name}_weight.npy", weight.detach().cpu().numpy())
+                np.save(f"export/{name}_scale.npy", scale.detach().cpu().numpy())
+                np.save(f"export/{name}_zero_point.npy", zero_point.detach().cpu().numpy())
+                np.save(f"export/{name}_bias.npy", bias.detach().cpu().numpy())
+            if type(m) is QAct:
+                scale = m.quantizer.scale
+                zero_point = m.quantizer.zero_point
+                assert m.bit_type.name == 'uint8'
+                # print(name, type(m).__name__, m.bit_type.name, scale.shape, zero_point.shape)
+                np.save(f"export/{name}_scale.npy", scale.detach().cpu().numpy())
+                np.save(f"export/{name}_zero_point.npy", zero_point.detach().cpu().numpy())
+            if type(m) is QIntSoftmax:
+                # print(name, type(m).__name__, m.bit_type.name)
+                assert m.bit_type.name == 'uint4'
+            if type(m) is QIntLayerNorm:
+                weight = m.weight
+                bias = m.bias
+                # print(name, type(m).__name__, weight.shape, weight.dtype)
+                np.save(f"export/{name}_weight.npy", weight.detach().cpu().numpy())
+                np.save(f"export/{name}_bias.npy", bias.detach().cpu().numpy())
 
 
 def validate(args, val_loader, model, criterion, device):
@@ -172,6 +237,7 @@ def validate(args, val_loader, model, criterion, device):
     # switch to evaluate mode
     model.eval()
 
+    print(f'Validating on {len(val_loader)} batches.')
     val_start_time = end = time.time()
     for i, (data, target) in enumerate(val_loader):
         data = data.to(device)
