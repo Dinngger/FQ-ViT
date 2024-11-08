@@ -67,20 +67,21 @@ class QAct:
         zero_point = self.zero_point.reshape(range_shape)
         outputs = (inputs.astype(np.float32) - zero_point) * scale
         return outputs.astype(np.float32)
-    def __call__(self, x):
-        return self.quant(x)
 
-def int_matmul(x, w, xq: QAct, wq: QAct):
+def int_matmul(x, w, xq: QAct, wq: QAct):   # zq: QAct
     assert x.dtype == np.uint8, x.dtype
     assert w.dtype == np.int8, w.dtype
-    x = x.astype(np.int32)  # (N, D)
+    N, D = x.shape
     w = w.transpose(1, 0)   # (D, E)
-    xw = x @ w  # (N, E)
-    wz = wq.zero_point.astype(np.float32) * np.ones_like(w, dtype=np.float32)
-    xz = xq.zero_point.astype(np.float32) * np.ones_like(x, dtype=np.float32)
+    xw = np.matmul(x, w, dtype=np.int32)  # (N, E)
+    wz = wq.zero_point.astype(np.float32)
+    xz = xq.zero_point.astype(np.float32)
     x = x.astype(np.float32)
+    w = w.astype(np.float32)
     xw = xw.astype(np.float32)
-    xw = xq.scale * wq.scale * (xw - x @ wz - xz @ w + xz @ wz)
+    xw = xq.scale * wq.scale * (xw - x.sum(axis=1, keepdims=True) * wz \
+                                   - w.sum(axis=0, keepdims=True) * xz \
+                                   + (wz * xz * D))
     assert xw.dtype == np.float32, xw.dtype
     return xw
 
@@ -89,7 +90,7 @@ class QConv2d:
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
         self.quantizer = QAct(name, 'weight')
-        self.weight = self.quantizer(self.weight)
+        self.weight = self.quantizer.quant(self.weight)
     def __call__(self, x, xq):
         assert x.dtype == np.uint8, x.dtype
         assert x.shape == (1, 3, 224, 224)
@@ -109,10 +110,15 @@ class QLinear:
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
         self.quantizer = QAct(name, 'weight')
-        self.weight = self.quantizer(self.weight)
+        self.weight = self.quantizer.quant(self.weight)
     def __call__(self, x, xq):
         assert x.dtype == np.uint8, x.dtype
-        x = int_matmul(x, self.weight, xq, self.quantizer)
+        if x.ndim == 3:  # B, N, D
+            assert x.shape[0] == 1, x.shape
+            x = int_matmul(x[0], self.weight, xq, self.quantizer)
+            x = np.expand_dims(x, 0)
+        else:   # B, D
+            x = int_matmul(x, self.weight, xq, self.quantizer)
         x = x + self.bias.reshape(1, 1, -1)
         return x
 
@@ -126,13 +132,13 @@ class QIntLayerNorm:
         M = np.clip(np.floor(x * np.power(2, N)), 0, 2 ** bit - 1)
         return M, N
     def __call__(self, x, in_quantizer, out_quantizer):
-        assert x.dtype == np.float32, x.dtype
+        assert x.dtype == np.uint8, x.dtype
         in_scale = in_quantizer.scale
         out_scale = out_quantizer.scale
         channel_nums = x.shape[-1]
         in_scale = in_scale.reshape(1, 1, -1)
         out_scale = out_scale.reshape(1, 1, -1)
-        x_q = (x / in_scale).round()
+        x_q = x.astype(np.float32) - in_quantizer.zero_point
         in_scale1 = in_scale.min()
         in_scale_mask = (in_scale / in_scale1).round()
         x_q = x_q * in_scale_mask
@@ -160,7 +166,7 @@ class QIntSoftmax:
         big[extra_mask] = big[extra_mask] + 1
         return big
     @staticmethod
-    def int_softmax(x, scaling_factor):
+    def int_softmax(x, xq: QAct):
         def int_polynomial(x_int, scaling_factor):
             coef = [0.35815147, 0.96963238, 1.]  # ax**2 + bx + c
             coef[1] /= coef[0]
@@ -183,27 +189,35 @@ class QIntSoftmax:
             exp_int = np.clip(np.floor(exp_int * 2**(n - q)), 0, None)
             scaling_factor = exp_scaling_factor / 2**n
             return exp_int, scaling_factor
-        x_int = x / scaling_factor
+        x_int = x.astype(np.float32) - xq.zero_point
         x_int_max = x_int.max(axis=-1, keepdims=True)
         x_int = x_int - x_int_max
-        exp_int, exp_scaling_factor = int_exp(x_int, scaling_factor)
+        exp_int, exp_scaling_factor = int_exp(x_int, xq.scale)
         exp_int_sum = exp_int.sum(axis=-1, keepdims=True)
         return exp_int, exp_int_sum
-    def __call__(self, x, scale):
-        assert x.dtype == np.float32, x.dtype
-        exp_int, exp_int_sum = self.int_softmax(x, scale)
+    def __call__(self, x, xq):
+        assert x.dtype == np.uint8, x.dtype
+        exp_int, exp_int_sum = self.int_softmax(x, xq)
         softmax_out = np.round(exp_int_sum / exp_int)
         rounds = self.log_round(softmax_out)    # uint4
         mask = rounds >= 2**4
         qlog = np.clip(rounds, 0, 2**4 - 1)
         deq_softmax = 2**(-qlog)
         deq_softmax[mask] = 0
-        return deq_softmax
+        return deq_softmax.astype(np.float32)
 
-def mm_attention(q, k):
-    assert q.dtype == np.float32, q.dtype
-    assert k.dtype == np.float32, k.dtype
-    z = np.einsum('BHMN,BHNK->BHMK', q, k.transpose(0, 1, 3, 2))
+def mm_attention(q, k, qact):
+    assert q.dtype == np.uint8, q.dtype
+    assert k.dtype == np.uint8, k.dtype
+    k = k.transpose(0, 1, 3, 2)
+    z = np.einsum('BHMN,BHNK->BHMK', q, k, dtype=np.uint32)
+    qz = qact.zero_point.astype(np.float32)
+    z = z.astype(np.float32)
+    qkz = q.astype(np.float32).sum(axis=3, keepdims=True) * qz
+    qzk = k.astype(np.float32).sum(axis=2, keepdims=True) * qz
+    qzkz = qz * qz * q.shape[-1]
+    z = qact.scale * qact.scale * (z - qkz - qzk + qzkz)
+    assert z.dtype == np.float32, z.dtype
     return z
 
 class Attention:
@@ -223,19 +237,20 @@ class Attention:
         assert x.dtype == np.uint8, x.dtype
         B, N, C = x.shape
         x = self.qkv(x, xq)
-        x = self.qact1.dequant(self.qact1(x))
+        x = self.qact1.quant(x)
         qkv = x.reshape(B, N, 3, self.num_heads,
                         C // self.num_heads).transpose(2, 0, 3, 1, 4)  # (BN33)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = mm_attention(q, k) * self.scale
-        attn = self.qact_attn1.dequant(self.qact_attn1(attn))
-        attn = self.log_int_softmax(attn, self.qact_attn1.scale)
+        v = self.qact1.dequant(v)
+        attn = mm_attention(q, k, self.qact1) * self.scale
+        attn = self.qact_attn1.quant(attn)
+        attn = self.log_int_softmax(attn, self.qact_attn1)
         x = np.einsum('BHMN,BHNK->BHMK', attn, v)
         x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
-        x = self.qact2(x)
+        x = self.qact2.quant(x)
         x = self.proj(x, self.qact2)
-        x = self.qact3.dequant(self.qact3(x))
-        return x
+        x = self.qact3.quant(x)
+        return x, self.qact3
 
 class GELU:
     def __call__(self, x):
@@ -251,10 +266,16 @@ class Mlp:
     def __call__(self, x, xq):
         x = self.fc1(x, xq)
         x = self.act(x)
-        x = self.qact1(x)
+        x = self.qact1.quant(x)
         x = self.fc2(x, self.qact1)
-        x = self.qact2.dequant(self.qact2(x))
-        return x
+        x = self.qact2.quant(x)
+        return x, self.qact2
+
+def q_add(a, b, aq: QAct, bq: QAct, zq: QAct):
+    assert a.dtype == np.uint8, a.dtype
+    assert b.dtype == np.uint8, b.dtype
+    z = aq.dequant(a) + bq.dequant(b)
+    return zq.quant(z), zq
 
 class Block:
     def __init__(self, name):
@@ -266,13 +287,13 @@ class Block:
         self.qact3 = QAct(f"{name}.qact3")
         self.mlp = Mlp(f"{name}.mlp")
         self.qact4 = QAct(f"{name}.qact4")
-    def __call__(self, x, last_quantizer):
-        assert x.dtype == np.float32, x.dtype
-        x = self.qact2.dequant(self.qact2(x.astype(np.float32) + self.attn(self.qact1(
-                self.norm1(x, last_quantizer, self.qact1)), self.qact1)))
-        x = self.qact4.dequant(self.qact4(x.astype(np.float32) + self.mlp(self.qact3(
-                self.norm2(x, self.qact2, self.qact3)), self.qact3)))
-        return x
+    def __call__(self, x, xq: QAct):
+        assert x.dtype == np.uint8, x.dtype
+        y, yq = self.attn(self.qact1.quant(self.norm1(x, xq, self.qact1)), self.qact1)
+        x, xq = q_add(x, y, xq, yq, self.qact2)
+        y, yq = self.mlp(self.qact3.quant(self.norm2(x, self.qact2, self.qact3)), self.qact3)
+        x, xq = q_add(x, y, xq, yq, self.qact4)
+        return x, xq
 
 class DeiT_tiny:
     def __init__(self):
@@ -283,28 +304,29 @@ class DeiT_tiny:
         self.qact_embed = QAct("qact_embed")
         self.pos_embed = np.load("export/pos_embed.npy")
         self.qact1 = QAct("qact1")
+        self.cls_token = self.qact_embed.dequant(self.qact_embed.quant(self.cls_token))
+        self.cls_token = self.qact1.quant(self.cls_token)
+        self.pos_embed = (self.pos_embed / self.qact1.scale)#.astype(np.int32)
         self.blocks = [Block(f"blocks.{i}") for i in range(12)]
         self.norm = QIntLayerNorm("norm")
         self.qact2 = QAct("qact2")
         self.head = QLinear("head")
         self.act_out = QAct("act_out")
     def __call__(self, x):
-        x = self.qact_input(x)
+        x = self.qact_input.quant(x)
         x = self.patch_embed_proj(x, self.qact_input)
-        x = self.patch_embed_qact.dequant(self.patch_embed_qact(x))
+        x = self.patch_embed_qact.dequant(self.patch_embed_qact.quant(x))
+        x = self.qact_embed.dequant(self.qact_embed.quant(x))
+        x = self.qact1.quant(x)
         x = np.concatenate((self.cls_token, x), axis=1)
-        x = self.qact_embed.dequant(self.qact_embed(x))
-        x = x + self.pos_embed
-        x = self.qact1.dequant(self.qact1(x))
-        last_quantizer = self.qact1
+        x = (x + self.pos_embed).astype(np.uint8)
+        xq = self.qact1
         for b in self.blocks:
-            x = b(x, last_quantizer)
-            last_quantizer = b.qact4
-        x = self.norm(x, last_quantizer, self.qact2)[:, 0]
-        x = self.qact2(x)
+            x, xq = b(x, xq)
+        x = self.norm(x, xq, self.qact2)[:, 0]
+        x = self.qact2.quant(x)
         x = self.head(x, self.qact2)
-        x = self.act_out.dequant(self.act_out(x))
-        assert x.dtype == np.float32, x.dtype
+        x = self.act_out.quant(x)
         return x
 
 valdir = '/media/dinger/inner/Dataset/ImageNet/val'
