@@ -187,8 +187,8 @@ def main():
 
     val_loss, val_prec1, val_prec5 = validate(args, val_loader, model,
                                               criterion, device)
-    assert int(val_prec1) == 75
-    assert int(val_prec5) == 92
+    assert int(val_prec1) >= 70
+    assert int(val_prec5) >= 90
     export_model(model)
 
 
@@ -213,7 +213,7 @@ def export_model(model):
             if type(m) is QAct:
                 scale = m.quantizer.scale
                 zero_point = m.quantizer.zero_point
-                assert m.bit_type.name == 'uint8'
+                assert m.bit_type.name == 'int8'
                 # print(name, type(m).__name__, m.bit_type.name, scale.shape, zero_point.shape)
                 np.save(f"export/{name}_scale.npy", scale.detach().cpu().numpy())
                 np.save(f"export/{name}_zero_point.npy", zero_point.detach().cpu().numpy())

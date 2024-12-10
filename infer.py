@@ -19,112 +19,111 @@ t.append(transforms.ToTensor())
 t.append(transforms.Normalize(mean, std))
 transform = transforms.Compose(t)
 
-class QAct:
-    def __init__(self, name, module_type='activation'):
-        self.module_type = module_type
+class QWeight:
+    def __init__(self, name):
         self.scale = np.load(f"export/{name}_scale.npy")
-        self.zero_point = np.load(f"export/{name}_zero_point.npy")
     def get_reshape_range(self, inputs):
-        if self.module_type == 'weight':
-            if len(inputs.shape) == 2:
-                range_shape = (-1, 1)
-            elif len(inputs.shape) == 4:
-                range_shape = (-1, 1, 1, 1)
-            else:
-                raise NotImplementedError
+        if len(inputs.shape) == 2:
+            range_shape = (-1, 1)
+        elif len(inputs.shape) == 4:
+            range_shape = (-1, 1, 1, 1)
         else:
-            if len(inputs.shape) == 2:
-                range_shape = (1, -1)
-            elif len(inputs.shape) == 3:
-                range_shape = (1, 1, -1)
-            elif len(inputs.shape) == 4:
-                range_shape = (1, -1, 1, 1)
-            else:
-                raise NotImplementedError
+            raise NotImplementedError
         return range_shape
     def quant(self, inputs):
         assert inputs.dtype == np.float32, inputs.dtype
         range_shape = self.get_reshape_range(inputs)
         scale = self.scale.reshape(range_shape)
-        zero_point = self.zero_point.reshape(range_shape)
-        outputs = inputs / scale + zero_point
-        # return outputs.astype(np.uint8)
-        if self.module_type == 'activation':
-            outputs = np.clip(outputs.round(), 0, 2**8 - 1)
-            return outputs.astype(np.uint8)
-        elif self.module_type == 'weight':
-            outputs = np.clip(outputs.round(), -2**7, 2**7 - 1)
-            return outputs.astype(np.int8)
-        else:
-            raise NotImplementedError
+        outputs = inputs / scale
+        outputs = np.clip(outputs.round(), -2**7, 2**7 - 1)
+        return outputs.astype(np.int8)
     def dequant(self, inputs):
-        if self.module_type == 'activation':
-            assert inputs.dtype == np.uint8, inputs.dtype
-        else:
-            assert inputs.dtype == np.int8, inputs.dtype
+        assert inputs.dtype == np.int8, inputs.dtype
         range_shape = self.get_reshape_range(inputs)
         scale = self.scale.reshape(range_shape)
-        zero_point = self.zero_point.reshape(range_shape)
-        outputs = (inputs.astype(np.float32) - zero_point) * scale
+        outputs = inputs.astype(np.float32)
+        outputs = outputs * scale
         return outputs.astype(np.float32)
 
-def int_matmul(x, w, xq: QAct, wq: QAct):   # zq: QAct
-    assert x.dtype == np.uint8, x.dtype
+class QAct:
+    def __init__(self, name):
+        self.scale = np.load(f"export/{name}_scale.npy")
+    def get_reshape_range(self, inputs):
+        if len(inputs.shape) == 2:
+            range_shape = (1, -1)
+        elif len(inputs.shape) == 3:
+            range_shape = (1, 1, -1)
+        elif len(inputs.shape) == 4:
+            range_shape = (1, -1, 1, 1)
+        else:
+            raise NotImplementedError
+        return range_shape
+    def quant(self, inputs):
+        assert inputs.dtype == np.float32, inputs.dtype
+        range_shape = self.get_reshape_range(inputs)
+        scale = self.scale.reshape(range_shape)
+        outputs = inputs / scale
+        outputs = np.clip(outputs.round(), -2**7, 2**7 - 1)
+        return outputs.astype(np.int8)
+    def dequant(self, inputs):
+        assert inputs.dtype == np.int8, inputs.dtype
+        range_shape = self.get_reshape_range(inputs)
+        scale = self.scale.reshape(range_shape)
+        outputs = inputs.astype(np.float32)
+        outputs = outputs * scale
+        return outputs.astype(np.float32)
+
+def int_matmul(x, w, b, xq: QAct, wq: QWeight, zq: QAct, act=None):
+    assert x.dtype == np.int8, x.dtype
     assert w.dtype == np.int8, w.dtype
     N, D = x.shape
     w = w.transpose(1, 0)   # (D, E)
     xw = np.matmul(x, w, dtype=np.int32)  # (N, E)
-    wz = wq.zero_point.astype(np.float32)
-    xz = xq.zero_point.astype(np.float32)
-    x = x.astype(np.float32)
-    w = w.astype(np.float32)
+    xw = xw + b / (xq.scale * wq.scale)
     xw = xw.astype(np.float32)
-    xw = xq.scale * wq.scale * (xw - x.sum(axis=1, keepdims=True) * wz \
-                                   - w.sum(axis=0, keepdims=True) * xz \
-                                   + (wz * xz * D))
-    assert xw.dtype == np.float32, xw.dtype
+    xw = xw * (xq.scale * wq.scale)# / zq.scale
+    # xw = np.clip(xw.round(), -2**7, 2**7 - 1)
+    # xw = xw.astype(np.int8)
+    xw = zq.quant(xw)
+    if act is not None:
+        xw = act(xw, zq)
     return xw
 
 class QConv2d:
     def __init__(self, name):
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
-        self.quantizer = QAct(name, 'weight')
-        self.weight = self.quantizer.quant(self.weight)
-    def __call__(self, x, xq: QAct, zq: QAct):
-        assert x.dtype == np.uint8, x.dtype
-        assert x.shape == (1, 3, 224, 224)
-        assert self.weight.shape == (192, 3, 16, 16)
         assert self.bias.shape == (192,)
-        reshaped_x = np.zeros((768, 14 * 14), dtype=np.uint8)
+        self.bias = self.bias.reshape(1, 192)
+        self.quantizer = QWeight(name)
+        self.weight = self.quantizer.quant(self.weight)
+        assert self.weight.shape == (192, 3, 16, 16)
+        self.weight = self.weight.reshape(192, 768)
+    def __call__(self, x, xq: QAct, zq: QAct):
+        assert x.dtype == np.int8, x.dtype
+        assert x.shape == (1, 3, 224, 224)
+        reshaped_x = np.zeros((768, 14 * 14), dtype=np.int8)
         for i in range(14):
             for j in range(14):
                 reshaped_x[:, i * 14 + j] = x[0, :, i*16:i*16+16, j*16:j*16+16].flatten()
-        weight = self.weight.reshape(192, 768)
-        output = int_matmul(reshaped_x.T, weight, xq, self.quantizer).T
-        output = output + self.bias.reshape(192, 1)
+        output = int_matmul(reshaped_x.T, self.weight, self.bias, xq, self.quantizer, zq).T
         output = output.reshape(1, 192, 14 * 14).transpose(0, 2, 1)
-        output = zq.quant(output)
         return output
 
 class QLinear:
     def __init__(self, name):
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
-        self.quantizer = QAct(name, 'weight')
+        self.quantizer = QWeight(name)
         self.weight = self.quantizer.quant(self.weight)
     def __call__(self, x, xq: QAct, zq: QAct, act=None):
-        assert x.dtype == np.uint8, x.dtype
+        assert x.dtype == np.int8, x.dtype
         if x.ndim == 3:  # B, N, D
             assert x.shape[0] == 1, x.shape
-            x = int_matmul(x[0], self.weight, xq, self.quantizer)
+            x = int_matmul(x[0], self.weight, self.bias.reshape(1, -1), xq, self.quantizer, zq, act)
             x = np.expand_dims(x, 0)
         else:   # B, D
-            x = int_matmul(x, self.weight, xq, self.quantizer)
-        x = x + self.bias.reshape(1, 1, -1)
-        if act is not None:
-            x = act(x)
-        x = zq.quant(x)
+            x = int_matmul(x, self.weight, self.bias.reshape(1, 1, -1), xq, self.quantizer, zq, act)
         return x
 
 class QIntLayerNorm:
@@ -137,13 +136,13 @@ class QIntLayerNorm:
         M = np.clip(np.floor(x * np.power(2, N)), 0, 2 ** bit - 1)
         return M, N
     def __call__(self, x, xq: QAct, zq: QAct):
-        assert x.dtype == np.uint8, x.dtype
+        assert x.dtype == np.int8, x.dtype
         in_scale = xq.scale
         out_scale = zq.scale
         channel_nums = x.shape[-1]
         in_scale = in_scale.reshape(1, 1, -1)
         out_scale = out_scale.reshape(1, 1, -1)
-        x_q = x.astype(np.float32) - xq.zero_point
+        x_q = x.astype(np.float32)
         in_scale1 = in_scale.min()
         in_scale_mask = (in_scale / in_scale1).round()
         x_q = x_q * in_scale_mask
@@ -160,7 +159,7 @@ class QIntLayerNorm:
                 np.power(2, N)).round()
         x_q = ((A_sign * M * x_q + B) / np.power(2, N)).round()
         x = x_q * out_scale
-        x = zq.quant(x)
+        x = zq.quant(x.astype(np.float32))
         return x
 
 class QIntSoftmax:
@@ -195,14 +194,14 @@ class QIntSoftmax:
             exp_int = np.clip(np.floor(exp_int * 2**(n - q)), 0, None)
             scaling_factor = exp_scaling_factor / 2**n
             return exp_int, scaling_factor
-        x_int = x.astype(np.float32) - xq.zero_point
+        x_int = x.astype(np.float32)
         x_int_max = x_int.max(axis=-1, keepdims=True)
         x_int = x_int - x_int_max
         exp_int, exp_scaling_factor = int_exp(x_int, xq.scale)
         exp_int_sum = exp_int.sum(axis=-1, keepdims=True)
         return exp_int, exp_int_sum
     def __call__(self, x, xq: QAct):
-        assert x.dtype == np.uint8, x.dtype
+        assert x.dtype == np.int8, x.dtype
         exp_int, exp_int_sum = self.int_softmax(x, xq)
         softmax_out = np.round(exp_int_sum / exp_int)
         rounds = self.log_round(softmax_out)    # uint4
@@ -213,16 +212,12 @@ class QIntSoftmax:
         return deq_softmax.astype(np.float32)
 
 def mm_attention(q, k, inq: QAct, out_scale, outq: QAct):
-    assert q.dtype == np.uint8, q.dtype
-    assert k.dtype == np.uint8, k.dtype
+    assert q.dtype == np.int8, q.dtype
+    assert k.dtype == np.int8, k.dtype
     k = k.transpose(0, 1, 3, 2)
-    z = np.einsum('BHMN,BHNK->BHMK', q, k, dtype=np.uint32)
-    qz = inq.zero_point.astype(np.float32)
+    z = np.einsum('BHMN,BHNK->BHMK', q, k, dtype=np.int32)
     z = z.astype(np.float32)
-    qkz = q.astype(np.float32).sum(axis=3, keepdims=True) * qz
-    qzk = k.astype(np.float32).sum(axis=2, keepdims=True) * qz
-    qzkz = qz * qz * q.shape[-1]
-    z = inq.scale * inq.scale * (z - qkz - qzk + qzkz)
+    z = inq.scale * inq.scale * z
     z = z * out_scale
     z = outq.quant(z)
     return z
@@ -241,7 +236,7 @@ class Attention:
         self.proj = QLinear(f"{name}.proj")
         self.qact3 = QAct(f"{name}.qact3")
     def __call__(self, x, xq: QAct):
-        assert x.dtype == np.uint8, x.dtype
+        assert x.dtype == np.int8, x.dtype
         B, N, C = x.shape
         x = self.qkv(x, xq, self.qact1)
         qkv = x.reshape(B, N, 3, self.num_heads,
@@ -257,8 +252,10 @@ class Attention:
         return x, self.qact3
 
 class GELU:
-    def __call__(self, x):
-        return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))
+    def __call__(self, x, xq: QAct):
+        x = xq.dequant(x)
+        x = (0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))).astype(np.float32)
+        return xq.quant(x)
 
 class Mlp:
     def __init__(self, name):
@@ -273,15 +270,13 @@ class Mlp:
         return x, self.qact2
 
 def q_add(a, b, aq: QAct, bq: QAct, cq: QAct):
-    assert a.dtype == np.uint8, a.dtype
-    assert b.dtype == np.uint8, b.dtype
+    assert a.dtype == np.int8, a.dtype
+    assert b.dtype == np.int8, b.dtype
     s_a2c = aq.scale / cq.scale
     s_b2c = bq.scale / cq.scale
-    z_c = cq.zero_point - s_a2c * aq.zero_point - s_b2c * bq.zero_point
-    c = s_a2c * a + s_b2c * b + z_c
-    c = c.round().clip(0, 255)
-    c = c.astype(np.uint8)
-    # c = cq.quant(aq.dequant(a) + bq.dequant(b))
+    c = s_a2c * a + s_b2c * b
+    c = c.round().clip(-2**7, 2**7 - 1)
+    c = c.astype(np.int8)
     return c, cq
 
 class Block:
@@ -295,7 +290,7 @@ class Block:
         self.mlp = Mlp(f"{name}.mlp")
         self.qact4 = QAct(f"{name}.qact4")
     def __call__(self, x, xq: QAct):
-        assert x.dtype == np.uint8, x.dtype
+        assert x.dtype == np.int8, x.dtype
         y, yq = self.attn(self.norm1(x, xq, self.qact1), self.qact1)
         x, xq = q_add(x, y, xq, yq, self.qact2)
         y, yq = self.mlp(self.norm2(x, self.qact2, self.qact3), self.qact3)
@@ -322,7 +317,7 @@ class DeiT_tiny:
         x = self.qact_input.quant(x)
         x = self.patch_embed_proj(x, self.qact_input, self.qact1)
         x = np.concatenate((self.cls_token, x), axis=1)
-        x = (x + self.pos_embed).astype(np.uint8)
+        x = (x + self.pos_embed).astype(np.int8)
         xq = self.qact1
         for b in self.blocks:
             x, xq = b(x, xq)

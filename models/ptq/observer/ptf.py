@@ -10,6 +10,7 @@ class PtfObserver(BaseObserver):
     def __init__(self, module_type, bit_type, calibration_mode):
         super(PtfObserver, self).__init__(module_type, bit_type,
                                           calibration_mode)
+        self.symmetric = self.bit_type.signed
 
     def update(self, v):
         v = self.reshape_tensor(v)
@@ -38,13 +39,19 @@ class PtfObserver(BaseObserver):
         best_score = 1e+10
         max_val_t = max_val.max()
         min_val_t = min_val.min()
-        scale8 = (max_val_t - min_val_t) / float(qmax - qmin)
+        if self.symmetric:
+            scale8 = torch.max(-min_val_t, max_val_t) / (float(qmax - qmin) / 2)
+        else:
+            scale8 = (max_val_t - min_val_t) / float(qmax - qmin)
         scale8.clamp_(self.eps)
         scale4 = scale8 / 2
         scale2 = scale4 / 2
         scale1 = scale2 / 2
-        zero_point = qmin - torch.round(min_val_t / scale8)
-        zero_point.clamp_(qmin, qmax)
+        if self.symmetric:
+            zero_point = torch.zeros_like(min_val_t, dtype=torch.int64)
+        else:
+            zero_point = qmin - torch.round(min_val_t / scale8)
+            zero_point.clamp_(qmin, qmax)
         scale_mask = torch.ones_like(max_val)
         for j in range(inputs.shape[2]):
             data = inputs[..., j].unsqueeze(-1)

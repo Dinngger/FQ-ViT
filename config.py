@@ -10,7 +10,7 @@ class Config:
         These two are proposed in our "FQ-ViT: Post-Training Quantization for Fully Quantized Vision Transformer".
         '''
         self.BIT_TYPE_W = BIT_TYPE_DICT['int8']
-        self.BIT_TYPE_A = BIT_TYPE_DICT['uint8']
+        self.BIT_TYPE_A = BIT_TYPE_DICT['int8']
 
         self.OBSERVER_W = 'minmax'
         self.OBSERVER_A = quant_method
