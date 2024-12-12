@@ -1,5 +1,6 @@
 import os
 import math
+from random import shuffle
 from time import time
 import numpy as np
 from PIL import Image
@@ -80,11 +81,9 @@ def int_matmul(x, w, b, xq: QAct, wq: QWeight, zq: QAct, act=None):
     w = w.transpose(1, 0)   # (D, E)
     xw = np.matmul(x, w, dtype=np.int32)  # (N, E)
     xw = xw + b / (xq.scale * wq.scale)
-    xw = xw.astype(np.float32)
-    xw = xw * (xq.scale * wq.scale)# / zq.scale
-    # xw = np.clip(xw.round(), -2**7, 2**7 - 1)
-    # xw = xw.astype(np.int8)
-    xw = zq.quant(xw)
+    xw = xw * (xq.scale * wq.scale / zq.scale)
+    xw = np.clip(xw.round(), -2**7, 2**7 - 1)
+    xw = xw.astype(np.int8)
     if act is not None:
         xw = act(xw, zq)
     return xw
@@ -130,96 +129,46 @@ class QIntLayerNorm:
     def __init__(self, name):
         self.weight = np.load(f"export/{name}_weight.npy")
         self.bias = np.load(f"export/{name}_bias.npy")
-    def get_MN(self, x):
-        bit = 8
-        N = np.clip(bit - 1 - np.floor(np.log2(x)), 0, 31)
-        M = np.clip(np.floor(x * np.power(2, N)), 0, 2 ** bit - 1)
-        return M, N
     def __call__(self, x, xq: QAct, zq: QAct):
         assert x.dtype == np.int8, x.dtype
         in_scale = xq.scale
-        out_scale = zq.scale
         channel_nums = x.shape[-1]
         in_scale = in_scale.reshape(1, 1, -1)
-        out_scale = out_scale.reshape(1, 1, -1)
-        x_q = x.astype(np.float32)
         in_scale1 = in_scale.min()
-        in_scale_mask = (in_scale / in_scale1).round()
-        x_q = x_q * in_scale_mask
-        mean_x_q = x_q.mean(axis=-1) * in_scale1
-        std_x_q = (in_scale1 / channel_nums) * np.sqrt(
-            channel_nums * (x_q**2).sum(axis=-1) - x_q.sum(axis=-1)**2)
-        A = np.expand_dims(in_scale1 / std_x_q, -1) * \
-            self.weight.reshape(1, 1, -1) / out_scale
-        A_sign = np.sign(A)
-        M, N = self.get_MN(np.abs(A))
-        B = ((self.bias.reshape(1, 1, -1) -
-                np.expand_dims(mean_x_q / std_x_q, -1) *
-                self.weight.reshape(1, 1, -1)) / out_scale *
-                np.power(2, N)).round()
-        x_q = ((A_sign * M * x_q + B) / np.power(2, N)).round()
-        x = x_q * out_scale
-        x = zq.quant(x.astype(np.float32))
-        return x
+        in_scale_mask = np.log2((in_scale / in_scale1).round()).astype(np.int8)
+        assert (in_scale_mask <= 8).all(), in_scale_mask.max()
+        x_q = np.left_shift(x, in_scale_mask, dtype=np.int16)
+        sum_x_q = x_q.sum(axis=-1, dtype=np.int32)
+        var_x_q = channel_nums * np.multiply(x_q, x_q, dtype=np.int32).sum(axis=-1) - sum_x_q**2
+        inv_std_x_q = 1.0 / np.sqrt(var_x_q.astype(np.float32))
+        out_scale = zq.scale.reshape(1, 1, -1)
+        weight = self.weight.reshape(1, 1, -1) / out_scale
+        bias = self.bias.reshape(1, 1, -1) / out_scale
+        x = (x_q.astype(np.float32) * np.expand_dims(channel_nums * inv_std_x_q, -1)
+             - np.expand_dims(sum_x_q.astype(np.float32) * inv_std_x_q, -1)
+            ) * weight + bias
+        x = np.clip(x.round(), -2**7, 2**7 - 1)
+        return x.astype(np.int8)
 
 class QIntSoftmax:
-    @staticmethod
-    def log_round(x):
-        x_log_floor = np.floor(np.log2(x))
-        big = x_log_floor
-        extra_mask = (x - 2**big) >= 2**(big - 1)
-        big[extra_mask] = big[extra_mask] + 1
-        return big
-    @staticmethod
-    def int_softmax(x, xq: QAct):
-        def int_polynomial(x_int, scaling_factor):
-            coef = [0.35815147, 0.96963238, 1.]  # ax**2 + bx + c
-            coef[1] /= coef[0]
-            coef[2] /= coef[0]
-            b_int = np.floor(coef[1] / scaling_factor)
-            c_int = np.floor(coef[2] / scaling_factor**2)
-            z = x_int + b_int
-            z = x_int * z
-            z = z + c_int
-            scaling_factor = coef[0] * scaling_factor**2
-            return z, scaling_factor
-        def int_exp(x_int, scaling_factor):
-            x0 = -0.6931  # -ln2
-            n = 30  # sufficiently large integer
-            x0_int = np.floor(x0 / scaling_factor)
-            x_int = np.maximum(x_int, n * x0_int)
-            q = np.floor(x_int / x0_int)
-            r = x_int - x0_int * q
-            exp_int, exp_scaling_factor = int_polynomial(r, scaling_factor)
-            exp_int = np.clip(np.floor(exp_int * 2**(n - q)), 0, None)
-            scaling_factor = exp_scaling_factor / 2**n
-            return exp_int, scaling_factor
-        x_int = x.astype(np.float32)
-        x_int_max = x_int.max(axis=-1, keepdims=True)
-        x_int = x_int - x_int_max
-        exp_int, exp_scaling_factor = int_exp(x_int, xq.scale)
-        exp_int_sum = exp_int.sum(axis=-1, keepdims=True)
-        return exp_int, exp_int_sum
     def __call__(self, x, xq: QAct):
         assert x.dtype == np.int8, x.dtype
-        exp_int, exp_int_sum = self.int_softmax(x, xq)
-        softmax_out = np.round(exp_int_sum / exp_int)
-        rounds = self.log_round(softmax_out)    # uint4
-        mask = rounds >= 2**4
-        qlog = np.clip(rounds, 0, 2**4 - 1)
-        deq_softmax = 2**(-qlog)
-        deq_softmax[mask] = 0
-        return deq_softmax.astype(np.float32)
+        x = x.astype(np.int16)
+        x = x - x.max(axis=-1, keepdims=True)
+        ex = np.exp(x.astype(np.float32) * xq.scale)
+        ex_sum = ex.sum(axis=-1, keepdims=True)
+        x = ex / ex_sum * 255
+        x = np.clip(x.round(), 0, 255)
+        return x.astype(np.uint8)
 
 def mm_attention(q, k, inq: QAct, out_scale, outq: QAct):
     assert q.dtype == np.int8, q.dtype
     assert k.dtype == np.int8, k.dtype
     k = k.transpose(0, 1, 3, 2)
     z = np.einsum('BHMN,BHNK->BHMK', q, k, dtype=np.int32)
-    z = z.astype(np.float32)
-    z = inq.scale * inq.scale * z
-    z = z * out_scale
-    z = outq.quant(z)
+    z = z * (inq.scale * inq.scale * out_scale / outq.scale)
+    z = np.clip(z.round(), -2**7, 2**7 - 1)
+    z = z.astype(np.int8)
     return z
 
 class Attention:
@@ -242,20 +191,28 @@ class Attention:
         qkv = x.reshape(B, N, 3, self.num_heads,
                         C // self.num_heads).transpose(2, 0, 3, 1, 4)  # (BN33)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        v = self.qact1.dequant(v)   # TODO: delete this
         attn = mm_attention(q, k, self.qact1, self.scale, self.qact_attn1)
         attn = self.log_int_softmax(attn, self.qact_attn1)
-        x = np.einsum('BHMN,BHNK->BHMK', attn, v)
+        x = np.einsum('BHMN,BHNK->BHMK', attn, v, dtype=np.int32)
+        x = x * (self.qact1.scale / self.qact2.scale / 255)
+        x = np.clip(x.round(), -2**7, 2**7 - 1).astype(np.int8)
         x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
-        x = self.qact2.quant(x)
         x = self.proj(x, self.qact2, self.qact3)
         return x, self.qact3
 
 class GELU:
+    def __init__(self):
+        self.break_points = [-2.424, -0.623, 0, 0.623, 2.424]
+        self.slopes = [-0.1, 0.26438, 0.73562, 1.1]
+        self.offset = [-0.2424, -0.01539, -0.01539, -0.2424]
     def __call__(self, x, xq: QAct):
-        x = xq.dequant(x)
-        x = (0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))).astype(np.float32)
-        return xq.quant(x)
+        assert x.dtype == np.int8, x.dtype
+        x = np.select(
+            [x < bp / xq.scale for bp in self.break_points] + [True],
+            [0] + [x.astype(np.float32) * s + o / xq.scale for s, o in zip(self.slopes, self.offset)] + [x])
+        x = np.clip(x.round(), -2**7, 2**7 - 1)
+        x = x.astype(np.int8)
+        return x
 
 class Mlp:
     def __init__(self, name):
@@ -328,10 +285,12 @@ class DeiT_tiny:
 valdir = '/media/dinger/inner/Dataset/ImageNet/val'
 with open(os.path.join(valdir, "val_list.txt"), "r") as f:
     lines = f.readlines()
+shuffle(lines)
 top1, top5 = 0, 0
 model = DeiT_tiny()
 times = []
-for i, line in enumerate(tqdm(lines)):
+pbar = tqdm(lines)
+for i, line in enumerate(pbar):
     now_img_idx = i
     name, label = line.strip().split()
     label = int(label)
@@ -346,6 +305,7 @@ for i, line in enumerate(tqdm(lines)):
     pred = np.argsort(output[0][0])[-5:][::-1]
     top1 += (pred[0] == label)
     top5 += (label in pred)
+    pbar.set_description(f"top1={100.*top1/(i+1):.2f}%, top5={100.*top5/(i+1):.2f}%")
 
 print(f"evaluated {len(lines)} images, time: avg {np.mean(times):.4f}s, min {np.min(times):.4f}s, max {np.max(times):.4f}s")
 print(f"top1 = {top1}, top5 = {top5}")
