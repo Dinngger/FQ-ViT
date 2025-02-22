@@ -189,14 +189,16 @@ def main():
                                               criterion, device)
     assert int(val_prec1) >= 70
     assert int(val_prec5) >= 90
-    export_model(model)
+    export_model(args.model, model)
 
 
-def export_model(model):
-    import numpy as np
-    np.save("export/cls_token.npy", model.cls_token.detach().cpu().numpy())
+def export_model(model_name, model):
+    if not os.path.exists('export'):
+        os.makedirs('export')
+    arrays = {}
+    arrays["cls_token"] = model.cls_token.detach().cpu().numpy()
     pos_embed = model.qact_pos(model.pos_embed)
-    np.save("export/pos_embed.npy", pos_embed.detach().cpu().numpy())
+    arrays["pos_embed"] = pos_embed.detach().cpu().numpy()
     with torch.no_grad():
         for name, m in model.named_modules():
             if type(m) in [QConv2d, QLinear]:
@@ -206,17 +208,17 @@ def export_model(model):
                 bias = m.bias
                 # print(name, type(m).__name__, m.bit_type.name, weight.shape, weight.dtype)
                 assert m.bit_type.name == 'int8'
-                np.save(f"export/{name}_weight.npy", weight.detach().cpu().numpy())
-                np.save(f"export/{name}_scale.npy", scale.detach().cpu().numpy())
-                np.save(f"export/{name}_zero_point.npy", zero_point.detach().cpu().numpy())
-                np.save(f"export/{name}_bias.npy", bias.detach().cpu().numpy())
+                arrays[f"{name}_weight"] = weight.detach().cpu().numpy()
+                arrays[f"{name}_scale"] = scale.detach().cpu().numpy()
+                arrays[f"{name}_zero_point"] = zero_point.detach().cpu().numpy()
+                arrays[f"{name}_bias"] = bias.detach().cpu().numpy()
             if type(m) is QAct:
                 scale = m.quantizer.scale
                 zero_point = m.quantizer.zero_point
                 assert m.bit_type.name == 'int8'
                 # print(name, type(m).__name__, m.bit_type.name, scale.shape, zero_point.shape)
-                np.save(f"export/{name}_scale.npy", scale.detach().cpu().numpy())
-                np.save(f"export/{name}_zero_point.npy", zero_point.detach().cpu().numpy())
+                arrays[f"{name}_scale"] = scale.detach().cpu().numpy()
+                arrays[f"{name}_zero_point"] = zero_point.detach().cpu().numpy()
             if type(m) is QIntSoftmax:
                 # print(name, type(m).__name__, m.bit_type.name)
                 assert m.bit_type.name == 'uint4'
@@ -224,8 +226,11 @@ def export_model(model):
                 weight = m.weight
                 bias = m.bias
                 # print(name, type(m).__name__, weight.shape, weight.dtype)
-                np.save(f"export/{name}_weight.npy", weight.detach().cpu().numpy())
-                np.save(f"export/{name}_bias.npy", bias.detach().cpu().numpy())
+                arrays[f"{name}_weight"] = weight.detach().cpu().numpy()
+                arrays[f"{name}_bias"] = bias.detach().cpu().numpy()
+    import numpy as np
+    np.savez(f"export/{model_name}.npz", **arrays)
+    print(f"Save model to {model_name}.npz")
 
 
 def validate(args, val_loader, model, criterion, device):

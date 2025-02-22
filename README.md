@@ -3,7 +3,15 @@
 
 ## Modification:
 - Run `test_quant.py` will save the **float** model and all quantizers into `export` folder.
-- Run `infer.py` will load the exported model and do inference using numpy uint8/int8 matmul.
+- Run `infer.py` will load the exported model and do inference using numpy/cupy uint8/int8 matmul.
+
+Test on a small subset of ImageNet (1000 train for calibration and 100 val for precision result).
+|  Method  | DeiT-T | DeiT-S | DeiT-B | ViT-B | ViT-L |
+| :------: | :----: | :----: | :----: | :---: | :---: |
+|   FP32   | 72.21  | 79.85  | 81.85  | 84.53 | 85.81 |
+|  FQ-ViT  | 77/94  | 83/98  | 84/100 | 80/97 | 84/98 |
+|  numpy   | 75/93  | 80/99  | -      | -     | -     |
+|   cupy   | 76/93  | 78/99  | 81/99  | 82/97 | 83/98 |
 
 ## Table of Contents
   - [Introduction](#introduction)
